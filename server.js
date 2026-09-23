@@ -511,9 +511,11 @@ function runFfmpeg(args, timeoutMs = 600000) {
     let err = "";
     p.stderr.on("data", (d) => (err = (err + d.toString()).slice(-20000)));
     const t = setTimeout(() => p.kill("SIGKILL"), timeoutMs);
-    p.on("close", (code) => {
+    p.on("close", (code, signal) => {
       clearTimeout(t);
-      code === 0 ? resolve(err) : reject(new Error(`ffmpeg hata (${code}): ${err.slice(-1500)}`));
+      if (code === 0) return resolve(err);
+      const why = signal ? `sinyal ${signal}${signal === "SIGKILL" ? " — muhtemelen bellek (OOM) ya da zaman aşımı" : ""}` : `kod ${code}`;
+      reject(new Error(`ffmpeg hata (${why}): ${err.slice(-1500)}`));
     });
     p.on("error", reject);
   });
@@ -568,7 +570,19 @@ async function renderProject(p, baseUrl, opt) {
       if (isVideo && info.duration) dur = Math.min(dur, info.duration);
       dur = Math.max(0.5, dur);
       total += dur;
-      if (isVideo) args.push("-t", dur.toFixed(3), "-i", file);
+      if (isVideo) {
+        // Bellek dostu ön işlem: 2K kaynağı tek başına hedef boyuta indir, sonra birleştir
+        const norm = path.join(work, `n${i}.mp4`);
+        await runFfmpeg([
+          "-i", file, "-t", dur.toFixed(3),
+          "-vf", `scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},fps=30,setsar=1,format=yuv420p`,
+          "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-threads", "2",
+          ...(info.hasAudio ? ["-c:a", "aac", "-b:a", "192k"] : ["-an"]),
+          norm,
+        ]);
+        fsp.rm(file, { force: true }).catch(() => {});
+        args.push("-t", dur.toFixed(3), "-i", norm);
+      }
       else args.push("-loop", "1", "-t", dur.toFixed(3), "-i", file);
       const zoom = isVideo ? "" : `,zoompan=z='min(zoom+0.0008,1.08)':d=${Math.ceil(dur * 30)}:s=${W}x${H}:fps=30`;
       filters.push(`[${idx}:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H}${zoom},fps=30,setsar=1,format=yuv420p,trim=duration=${dur.toFixed(3)},setpts=PTS-STARTPTS[v${i}]`);
@@ -633,7 +647,7 @@ async function renderProject(p, baseUrl, opt) {
     const outFile = path.join(DIRS.media, outName);
     const finalArgs = [...args, "-filter_complex", filters.join(";"), "-map", vOut];
     if (aOut) finalArgs.push("-map", aOut, "-c:a", "aac", "-b:a", "192k");
-    finalArgs.push("-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-r", "30", "-t", total.toFixed(3), "-movflags", "+faststart", outFile);
+    finalArgs.push("-threads", "2", "-filter_complex_threads", "1", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-r", "30", "-t", total.toFixed(3), "-movflags", "+faststart", outFile);
     await runFfmpeg(finalArgs);
     const rec = { file: outName, at: new Date().toISOString(), duration: Math.round(total * 10) / 10, format: p.format, subtitles: vOut === "[vsub]", options: opt };
     return rec;
