@@ -189,14 +189,7 @@ function render(data){
     ' · ' + (data.cost_source === "fal" ? "fal fiyat API" : "tahmini fiyat tablosu") + '</div>';
   el.querySelectorAll("[data-open]").forEach(b => b.onclick = () => openLink(b.dataset.open));
   el.querySelectorAll("img").forEach(b => b.onclick = () => openLink(b.dataset.url));
-  el.querySelectorAll("[data-dl]").forEach(b => b.onclick = async () => {
-    const url = b.dataset.dl;
-    try {
-      const r = await fetch(url); const blob = await r.blob();
-      const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
-      a.download = url.split("/").pop() || "fal.png"; document.body.appendChild(a); a.click(); a.remove();
-    } catch(e) { openLink(url); }
-  });
+  el.querySelectorAll("[data-dl]").forEach(b => b.onclick = () => openLink(b.dataset.dl));
   reportSize();
 }
 
