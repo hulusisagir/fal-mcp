@@ -110,11 +110,11 @@ async function runFal(modelId, input, timeoutMs = 240000) {
   throw new Error("fal zaman aşımı");
 }
 
-async function buildResult(result, modelId, prompt) {
+async function buildResult(result, modelId, prompt, baseUrl) {
   const raw = result.images || (result.image ? [result.image] : []);
   const images = raw
     .filter((i) => i && i.url)
-    .map((i) => ({ url: i.url, width: i.width || null, height: i.height || null }));
+    .map((i) => ({ url: i.url, width: i.width || null, height: i.height || null, download_url: baseUrl ? `${baseUrl}/dl?url=${encodeURIComponent(i.url)}` : i.url }));
   const price = await getPrice(modelId);
   const cost = estimateCost(price, images);
 
@@ -143,7 +143,7 @@ async function buildResult(result, modelId, prompt) {
 }
 
 // ---------- Galeri arayüzü (MCP Apps) ----------
-const UI_VERSION = "3";
+const UI_VERSION = "4";
 const UI_URI = `ui://fal/gallery-v${UI_VERSION}.html`;
 const UI_MIME = "text/html;profile=mcp-app";
 
@@ -185,11 +185,11 @@ function render(data){
         <div><div class="model">\${short}</div><div class="size">\${im.width && im.height ? im.width+"×"+im.height : ""}</div></div>
         <div class="cost">\${per != null ? "≈ $" + per.toFixed(3) : "—"}</div>
       </div>
-      <div class="meta"><button data-dl="\${im.url}">⬇ İndir</button><button data-open="\${im.url}">Tam boyut</button></div>
+      <div class="meta"><button data-dl="\${im.download_url || im.url}">⬇ İndir</button><button data-open="\${im.url}">Tam boyut</button></div>
       <div class="meta"><input readonly value="\${im.url}" style="flex:1;min-width:0;font:12px system-ui;padding:6px 8px;border-radius:8px;border:1px solid var(--line);background:transparent;color:inherit" onclick="this.select()"><button data-copy>Kopyala</button></div>
     </div>\`).join("") + '</div>' +
     '<div class="foot">Toplam ' + (data.cost_usd != null ? "≈ $" + data.cost_usd.toFixed(3) : "bilinmiyor") +
-    ' · ' + (data.cost_source === "fal" ? "fal fiyat API" : "tahmini fiyat tablosu") + ' · arayüz v3</div>';
+    ' · ' + (data.cost_source === "fal" ? "fal fiyat API" : "tahmini fiyat tablosu") + ' · arayüz v4</div>';
   el.querySelectorAll("[data-open]").forEach(b => b.onclick = () => openLink(b.dataset.open));
   el.querySelectorAll("img").forEach(b => b.onclick = () => openLink(b.dataset.url));
   el.querySelectorAll("[data-dl]").forEach(b => b.onclick = () => openLink(b.dataset.dl));
@@ -219,7 +219,7 @@ request("ui/initialize", {
 </script></body></html>`;
 
 // ---------- MCP sunucusu ----------
-function buildServer() {
+function buildServer(baseUrl) {
   const server = new McpServer({ name: "fal-ai", version: "3.0.0" });
 
   server.registerResource(
@@ -285,7 +285,7 @@ function buildServer() {
       if (aspect_ratio) input.aspect_ratio = aspect_ratio;
       if (seed !== undefined) input.seed = seed;
       try {
-        return await buildResult(await runFal(modelId, input), modelId, prompt);
+        return await buildResult(await runFal(modelId, input), modelId, prompt, baseUrl);
       } catch (e) {
         return { isError: true, content: [{ type: "text", text: String(e.message || e) }] };
       }
@@ -310,7 +310,7 @@ function buildServer() {
       const modelId = resolveModel(model);
       const input = { prompt, image_urls, num_images, ...(extra || {}) };
       try {
-        return await buildResult(await runFal(modelId, input), modelId, prompt);
+        return await buildResult(await runFal(modelId, input), modelId, prompt, baseUrl);
       } catch (e) {
         return { isError: true, content: [{ type: "text", text: String(e.message || e) }] };
       }
@@ -323,11 +323,29 @@ function buildServer() {
 // ---------- HTTP ----------
 const app = express();
 app.use(express.json({ limit: "10mb" }));
-app.get("/", (_req, res) => res.send("fal MCP v3 çalışıyor"));
+app.get("/", (_req, res) => res.send("fal MCP v4 çalışıyor"));
+
+// İndirme proxy'si: yalnızca fal.media görsellerini "attachment" olarak döndürür
+app.get("/dl", async (req, res) => {
+  try {
+    const u = new URL(String(req.query.url || ""));
+    const okHost = u.protocol === "https:" && (u.hostname === "fal.media" || u.hostname.endsWith(".fal.media"));
+    if (!okHost) return res.status(400).send("Geçersiz adres");
+    const r = await fetch(u.toString());
+    if (!r.ok) return res.status(502).send("Görsel alınamadı");
+    const name = (u.pathname.split("/").pop() || "fal.png").replace(/[^\w.\-]/g, "_");
+    res.setHeader("Content-Type", r.headers.get("content-type") || "application/octet-stream");
+    res.setHeader("Content-Disposition", `attachment; filename="${name}"`);
+    res.setHeader("Cache-Control", "private, max-age=3600");
+    res.send(Buffer.from(await r.arrayBuffer()));
+  } catch {
+    res.status(400).send("Geçersiz istek");
+  }
+});
 
 app.post(`/${MCP_SECRET}/mcp`, async (req, res) => {
   try {
-    const server = buildServer();
+    const server = buildServer(`https://${req.get("host")}`);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => {
       transport.close();
@@ -348,4 +366,4 @@ const notAllowed = (_req, res) =>
 app.get(`/${MCP_SECRET}/mcp`, notAllowed);
 app.delete(`/${MCP_SECRET}/mcp`, notAllowed);
 
-app.listen(PORT, () => console.log(`fal MCP v3 :${PORT} portunda`));
+app.listen(PORT, () => console.log(`fal MCP v4 :${PORT} portunda`));
