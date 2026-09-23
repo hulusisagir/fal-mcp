@@ -1,7 +1,7 @@
 {
   "name": "fal-mcp",
-  "version": "2.0.0",
-  "description": "Remote MCP server that exposes fal.ai image generation to Claude, with an inline gallery UI",
+  "version": "7.0.0",
+  "description": "fal.ai MCP server for Claude: image, video, audio, music, subtitles, ad-video projects with ffmpeg rendering",
   "type": "module",
   "main": "server.js",
   "scripts": {
@@ -13,6 +13,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.20.0",
     "express": "^4.21.0",
+    "ffmpeg-static": "^5.2.0",
     "zod": "^3.25.0"
   }
 }
