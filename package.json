@@ -1,6 +1,6 @@
 {
   "name": "fal-mcp",
-  "version": "7.0.0",
+  "version": "8.0.0",
   "description": "fal.ai MCP server for Claude: image, video, audio, music, subtitles, ad-video projects with ffmpeg rendering",
   "type": "module",
   "main": "server.js",

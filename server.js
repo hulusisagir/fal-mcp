@@ -16,7 +16,7 @@ import { z } from "zod";
 const FAL_KEY = process.env.FAL_KEY;
 const MCP_SECRET = process.env.MCP_SECRET;
 const PORT = process.env.PORT || 3000;
-const VERSION = "7";
+const VERSION = "8";
 
 if (!FAL_KEY || !MCP_SECRET) {
   console.error("FAL_KEY ve MCP_SECRET ortam değişkenleri gerekli.");
@@ -177,6 +177,41 @@ async function saveProject(p) {
   return p;
 }
 const newAsset = () => ({ candidates: [], chosen: null });
+
+// ---------- Onay kilidi (v8) ----------
+// Her projeye bağlı üretim bir "adım" açar. Farklı bir adıma geçmek için kullanıcının
+// panodaki "Onayla, İleri" butonuna basması gerekir (sadece HTTP ile açılır, MCP aracı yok).
+// Model gerektiren adımlarda kullanıcının seçenek kartından seçtiği model zorunludur.
+const STEP_LABEL = { storyboard: "Storyboard", image: "Görseller", video: "Videolar", voiceover: "Dış ses", music: "Müzik", subtitle: "Altyazı", render: "Birleştirme" };
+const MODEL_STEPS = ["image", "video", "voiceover", "music"];
+function ensureGate(p) {
+  if (!p.gate) p.gate = { step: null, open: true };
+  if (!p.gate_token) p.gate_token = rid(12);
+  if (!p.user_models) p.user_models = {};
+  return p;
+}
+async function gateCheck(project_id, step, modelId) {
+  if (!project_id) return;
+  const p = ensureGate(await loadProject(project_id));
+  const g = p.gate;
+  if (g.step && g.step !== step && !g.open)
+    throw new Error(
+      `ONAY BEKLENİYOR: "${STEP_LABEL[g.step] || g.step}" adımı kullanıcı tarafından onaylanmadı. ` +
+        `Bir sonraki adıma geçme. Kullanıcıdan panodaki "Onayla, İleri" butonuna basmasını iste ve bekle.`
+    );
+  if (MODEL_STEPS.includes(step) && modelId) {
+    const chosen = p.user_models[step];
+    if (!chosen)
+      throw new Error(
+        `MODEL SEÇİLMEDİ: "${STEP_LABEL[step]}" adımı için kullanıcı henüz model seçmedi. ` +
+          `search_models ile güncel seçenekleri al, present_choices'ı project_id="${p.id}" ve kind="${step}" ile göster, kullanıcının seçimini bekle.`
+      );
+    if (resolveModel(chosen) !== modelId)
+      throw new Error(`MODEL UYUŞMUYOR: Kullanıcı bu adım için "${chosen}" modelini seçti; "${modelId}" ile üretim yapılamaz. Başka model gerekiyorsa present_choices ile yeniden sor.`);
+  }
+  p.gate = { step, open: false, at: new Date().toISOString() };
+  await saveProject(p);
+}
 function newScene(f = {}) {
   return {
     id: rid(4),
@@ -233,6 +268,10 @@ function projectView(p, baseUrl) {
       renders: p.renders.slice(-3).map((r) => ({ ...r, download_url: `${baseUrl}/media-dl/${r.file}`, url: `${baseUrl}/media/${r.file}` })),
       spent_usd: Math.round((p.spent_usd || 0) * 1000) / 1000,
       persistent: PERSISTENT,
+      gate: p.gate ? { step: p.gate.step, label: STEP_LABEL[p.gate.step] || null, open: !!p.gate.open } : null,
+      gate_url: p.gate_token ? `${baseUrl}/gate/${encodeURIComponent(p.id)}/${p.gate_token}` : null,
+      user_models: p.user_models || {},
+      endcard: p.endcard || null,
     },
   };
 }
@@ -250,6 +289,9 @@ function projectResult(p, baseUrl, note) {
       video: s.video.chosen ? "onaylı" : `${s.video.candidates.length} aday`,
     })),
     voiceover: p.audio.voiceover.chosen ? "onaylı" : `${p.audio.voiceover.candidates.length} aday`,
+    gate: p.gate?.step ? `${STEP_LABEL[p.gate.step] || p.gate.step}: ${p.gate.open ? "kullanıcı onayladı" : "KULLANICI ONAYI BEKLENİYOR — sonraki adıma geçme"}` : null,
+    user_models: p.user_models || {},
+    endcard: p.endcard ? `${p.endcard.url} (${p.endcard.duration} sn)` : null,
     music: p.audio.music.chosen ? "onaylı" : `${p.audio.music.candidates.length} aday`,
     last_render: v.project.renders.length ? v.project.renders[v.project.renders.length - 1].url : null,
   };
@@ -559,10 +601,16 @@ async function renderProject(p, baseUrl, opt) {
     let idx = 0;
     let total = 0;
     const keepSceneAudio = !!opt.keep_scene_audio;
-    for (let i = 0; i < p.scenes.length; i++) {
-      const s = p.scenes[i];
+    const seq = [...p.scenes];
+    if (p.endcard?.url) {
+      const ecVid = /\.(mp4|webm|mov|m4v)(\?|$)/i.test(p.endcard.url);
+      const c = { url: p.endcard.url };
+      seq.push({ duration: p.endcard.duration || (ecVid ? null : 2), isEndcard: true, video: { chosen: ecVid ? c : null }, image: { chosen: ecVid ? null : c } });
+    }
+    for (let i = 0; i < seq.length; i++) {
+      const s = seq[i];
       const src = s.video.chosen?.url || s.image.chosen?.url;
-      if (!src) throw new Error(`Sahne ${i + 1} için onaylı görsel/video yok`);
+      if (!src) throw new Error(s.isEndcard ? "Endcard dosyası yok" : `Sahne ${i + 1} için onaylı görsel/video yok`);
       const isVideo = !!s.video.chosen;
       const file = await download(src, path.join(work, `s${i}.${extOf(src, isVideo ? "mp4" : "png")}`), baseUrl);
       const info = isVideo ? await probe(file) : { duration: null, hasAudio: false };
@@ -584,7 +632,7 @@ async function renderProject(p, baseUrl, opt) {
         args.push("-threads", "1", "-t", dur.toFixed(3), "-i", norm);
       }
       else args.push("-threads", "1", "-loop", "1", "-t", dur.toFixed(3), "-i", file);
-      const zoom = isVideo ? "" : `,zoompan=z='min(zoom+0.0008,1.08)':d=${Math.ceil(dur * 30)}:s=${W}x${H}:fps=30`;
+      const zoom = isVideo || s.isEndcard ? "" : `,zoompan=z='min(zoom+0.0008,1.08)':d=${Math.ceil(dur * 30)}:s=${W}x${H}:fps=30`;
       filters.push(`[${idx}:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H}${zoom},fps=30,setsar=1,format=yuv420p,trim=duration=${dur.toFixed(3)},setpts=PTS-STARTPTS[v${i}]`);
       vLabels.push(`[v${i}]`);
       if (keepSceneAudio) {
@@ -594,10 +642,10 @@ async function renderProject(p, baseUrl, opt) {
       idx++;
     }
     if (keepSceneAudio) {
-      filters.push(`${p.scenes.map((_, i) => `[v${i}][sa${i}]`).join("")}concat=n=${p.scenes.length}:v=1:a=1[vcat][scat]`);
+      filters.push(`${seq.map((_, i) => `[v${i}][sa${i}]`).join("")}concat=n=${seq.length}:v=1:a=1[vcat][scat]`);
       aLabels.push("[scat]");
     } else {
-      filters.push(`${vLabels.join("")}concat=n=${p.scenes.length}:v=1:a=0[vcat]`);
+      filters.push(`${vLabels.join("")}concat=n=${seq.length}:v=1:a=0[vcat]`);
     }
 
     // Altyazı
@@ -649,7 +697,7 @@ async function renderProject(p, baseUrl, opt) {
     if (aOut) finalArgs.push("-map", aOut, "-c:a", "aac", "-b:a", "192k");
     finalArgs.push("-threads", "2", "-filter_complex_threads", "1", "-c:v", "libx264", "-preset", "veryfast", "-rc-lookahead", "5", "-crf", "20", "-pix_fmt", "yuv420p", "-r", "30", "-t", total.toFixed(3), "-movflags", "+faststart", outFile);
     await runFfmpeg(finalArgs);
-    const rec = { file: outName, at: new Date().toISOString(), duration: Math.round(total * 10) / 10, format: p.format, subtitles: vOut === "[vsub]", options: opt };
+    const rec = { endcard: !!p.endcard?.url, file: outName, at: new Date().toISOString(), duration: Math.round(total * 10) / 10, format: p.format, subtitles: vOut === "[vsub]", options: opt };
     return rec;
   } finally {
     fsp.rm(work, { recursive: true, force: true }).catch(() => {});
@@ -700,6 +748,9 @@ function openLink(url){ try{ request("ui/open-link", {url}); }catch(e){} try{ wi
 function reportSize(){ notify("ui/notifications/size-changed", {height: document.documentElement.scrollHeight}); }
 function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 function copyText(text, btn){ const ta=document.createElement("textarea"); ta.value=text; document.body.appendChild(ta); ta.select(); try{document.execCommand("copy");}catch(e){} ta.remove(); if(navigator.clipboard) navigator.clipboard.writeText(text).catch(()=>{}); if(btn) btn.textContent="Kopyalandı"; }
+function gatePost(url){
+  return fetch(url, {method:"POST"}).then(r => r.json().then(j => { if(!r.ok) throw new Error(j.error || r.status); return j; }));
+}
 function say(text){
   const t = document.getElementById("toast");
   request("ui/message", {role:"user", content:[{type:"text", text}]}).then(r => {
@@ -758,6 +809,10 @@ function renderProject(p){
   if(p.concept) h += '<div class="muted">'+esc(p.concept)+'</div>';
   const m = p.models || {}; const ms = Object.keys(m).filter(k => m[k]);
   if(ms.length) h += '<div class="muted" style="margin-top:4px">Modeller: '+ms.map(k => esc(k)+': '+esc(String(m[k]).split("/").slice(-2).join("/"))).join(" · ")+'</div>';
+  if(p.gate && p.gate.step) h += '<div style="margin-top:6px">'+(p.gate.open ? '<span class="tag ok">'+esc(p.gate.label)+' onaylandı</span>' : '<span class="tag acc">'+esc(p.gate.label)+' · onayını bekliyor</span>')+'</div>';
+  const um = p.user_models || {}; const uk = Object.keys(um);
+  if(uk.length) h += '<div class="muted" style="margin-top:4px">Senin seçtiğin modeller: '+uk.map(k => esc(k)+': '+esc(String(um[k]).split("/").slice(-2).join("/"))).join(" · ")+'</div>';
+  if(p.endcard) h += '<div class="meta"><span class="muted">Endcard ('+esc(p.endcard.duration || "video süresi")+(p.endcard.duration ? ' sn' : '')+')</span>'+mediaTag(p.endcard.url, "", 'style="width:64px;height:auto;border-radius:6px"')+'</div>';
   if(!p.persistent) h += '<div class="toast">Uyarı: Railway Volume bağlı değil; sunucu yeniden başlarsa proje silinir.</div>';
   h += '</div>';
   h += '<div style="display:flex;flex-direction:column;gap:10px;margin-top:12px">';
@@ -820,7 +875,16 @@ function wire(){
       document.getElementById("picked").textContent = "Seçilen: " + sel.name;
       document.getElementById("next").disabled = false;
     });
-    document.getElementById("next").onclick = () => { if(!sel) return; say("Seçimim (" + c.step + "): " + sel.name + (sel.endpoint_id ? " [" + sel.endpoint_id + "]" : "") + ". Onaylıyorum, ileri."); document.getElementById("next").disabled = true; };
+    document.getElementById("next").onclick = () => {
+      if(!sel) return;
+      const btn = document.getElementById("next"); btn.disabled = true;
+      const msg = "Seçimim (" + c.step + "): " + sel.name + (sel.endpoint_id ? " [" + sel.endpoint_id + "]" : "") + ". Onaylıyorum, ileri.";
+      if(c.model_url && sel.endpoint_id){
+        gatePost(c.model_url + "&endpoint_id=" + encodeURIComponent(sel.endpoint_id))
+          .then(() => say(msg))
+          .catch(e => { btn.disabled = false; document.getElementById("picked").textContent = "Seçim kaydedilemedi: " + e.message; });
+      } else say(msg);
+    };
     document.getElementById("other").onclick = () => say("Bu adım (" + c.step + ") için başka seçenekler öner.");
   }
   if(current.view === "project"){
@@ -834,7 +898,13 @@ function wire(){
       say("Proje " + p.id + ", sahne " + b.dataset.edit + " düzenleme: " + v); inp.value = "";
     });
     document.getElementById("gensend").onclick = () => { const i = document.getElementById("gen"); const v = i.value.trim(); if(!v) return i.focus(); say("Proje " + p.id + " notu: " + v); i.value=""; };
-    document.getElementById("next").onclick = () => say("Proje " + p.id + ": bu adımı (" + (p.stages.find(s => s[0]===p.stage)||[,p.stage])[1] + ") onaylıyorum, sonraki adıma geç.");
+    document.getElementById("next").onclick = () => {
+      const btn = document.getElementById("next"); btn.disabled = true;
+      const label = (p.gate && p.gate.label) || (p.stages.find(s => s[0]===p.stage)||[,p.stage])[1];
+      const msg = "Proje " + p.id + ": bu adımı (" + label + ") onaylıyorum, sonraki adıma geç.";
+      if(!p.gate_url) return say(msg);
+      gatePost(p.gate_url + "/open").then(() => say(msg)).catch(e => { btn.disabled = false; document.getElementById("gen").placeholder = "Onay kaydedilemedi: " + e.message; });
+    };
   }
 }
 
@@ -932,7 +1002,19 @@ const attachSchema = {
 };
 
 function buildServer(baseUrl) {
-  const server = new McpServer({ name: "fal-ai", version: `${VERSION}.0.0` });
+  const server = new McpServer(
+    { name: "fal-ai", version: `${VERSION}.0.0` },
+    {
+      instructions: [
+        "Bu sunucu Hulusi'nin reklam videosu üretim hattıdır. KURAL: her adımda kullanıcı onayı alınır; asla iki adımı zincirleme.",
+        "Adımlar: storyboard → görseller → videolar → dış ses → (müzik) → altyazı → birleştirme.",
+        "Model gerektiren her adımda (görsel, video, dış ses, müzik): önce search_models ile güncel modelleri ve fiyatları al, sonra present_choices'ı project_id ve kind ile göster (2-4 seçenek, birini recommended işaretle). Kullanıcı kartta seçip İleri'ye basmadan üretim yapma.",
+        "Bir adımın üretimleri bitince sonucu göster ve DUR. Kullanıcı panodaki 'Onayla, İleri' butonuna basmadan (ya da açıkça onaylamadan) bir sonraki adımın aracını çağırma.",
+        "Sunucu bunu zorlar: 'ONAY BEKLENİYOR' veya 'MODEL SEÇİLMEDİ' hatası alırsan başka yoldan (run_model dahil) aşmaya çalışma; kullanıcıya ne beklendiğini söyle ve bekle.",
+        "Endcard/packshot: kullanıcı dosyayı upload_link sayfasından yükleyip linki verirse set_endcard ile projeye ekle; render sona otomatik ekler.",
+      ].join("\n"),
+    }
+  );
   const uiMeta = { ui: { resourceUri: UI_URI }, "ui/resourceUri": UI_URI };
   const tryRun = async (fn) => {
     try {
@@ -991,6 +1073,8 @@ function buildServer(baseUrl) {
         "Kullanıcıya tıklanabilir seçenek kartları + 'İleri' butonu gösterir (model seçimi, konsept/yön seçimi vb.). Kullanıcının seçimi sohbete mesaj olarak gelir. Seçenek sunmadan önce search_models ile güncel model ve fiyatları al.",
       inputSchema: {
         step: z.string().describe("Adım adı, örn. 'görsel modeli', 'video modeli', 'seslendirme', 'konsept'"),
+        project_id: z.string().optional().describe("Model seçimiyse zorunlu: seçim bu projeye kaydedilir"),
+        kind: z.enum(["image", "video", "voiceover", "music"]).optional().describe("Model seçimiyse zorunlu: hangi adımın modeli"),
         title: z.string(),
         subtitle: z.string().optional(),
         options: z
@@ -1011,6 +1095,11 @@ function buildServer(baseUrl) {
     },
     async (a) => {
       const s = { view: "choice", choice: a };
+      if (a.project_id && a.kind) {
+        const p = ensureGate(await loadProject(a.project_id));
+        await saveProject(p);
+        s.choice = { ...a, model_url: `${baseUrl}/gate/${encodeURIComponent(p.id)}/${p.gate_token}/model?kind=${a.kind}` };
+      }
       return { content: [{ type: "text", text: `Seçenekler gösterildi (${a.step}). Kullanıcının seçimini bekle.` }], structuredContent: s };
     }
   );
@@ -1109,15 +1198,18 @@ function buildServer(baseUrl) {
     async (a) =>
       tryRun(async () => {
         const p = await loadProject(a.project_id);
-        for (const k of ["name", "app", "concept", "format", "target_duration", "wants_music", "storyboard_approved"]) if (a[k] !== undefined) p[k] = a[k];
-        if (a.models) for (const [k, v] of Object.entries(a.models)) if (v) p.models[k] = resolveModel(v);
+        for (const k of ["name", "app", "concept", "format", "target_duration", "wants_music"]) if (a[k] !== undefined) p[k] = a[k];
+        if (a.storyboard_approved === false) p.storyboard_approved = false;
+        let note = "Güncellendi";
+        if (a.storyboard_approved === true) note = "Güncellendi. Storyboard onayı yalnızca kullanıcının panodaki 'Onayla, İleri' butonuyla verilir.";
+        if (a.models) note += " Model seçimi yalnızca kullanıcının seçenek kartından yapılır; models alanı yok sayıldı.";
         if (a.subtitle_enabled !== undefined || a.subtitle_style) {
           p.subtitle = p.subtitle || { cues: [], enabled: true, style: {} };
           if (a.subtitle_enabled !== undefined) p.subtitle.enabled = a.subtitle_enabled;
           if (a.subtitle_style) p.subtitle.style = { ...(p.subtitle.style || {}), ...a.subtitle_style };
         }
         await saveProject(p);
-        return projectResult(p, baseUrl, "Güncellendi");
+        return projectResult(p, baseUrl, note);
       })
   );
   const sceneFields = {
@@ -1139,6 +1231,7 @@ function buildServer(baseUrl) {
     },
     async ({ project_id, scenes, keep_assets }) =>
       tryRun(async () => {
+        await gateCheck(project_id, "storyboard");
         const p = await loadProject(project_id);
         const old = p.scenes;
         p.scenes = scenes.map((f, i) => {
@@ -1233,6 +1326,28 @@ function buildServer(baseUrl) {
       })
   );
 
+  server.registerTool(
+    "set_endcard",
+    {
+      title: "Endcard / packshot ekle",
+      description: "Kullanıcının yüklediği endcard/packshot (görsel veya video) dosyasını projeye ekler; render videonun sonuna ekler. url boş verilirse endcard kaldırılır.",
+      inputSchema: {
+        project_id: z.string(),
+        url: z.string().optional(),
+        duration: z.number().min(0.5).max(10).optional().describe("Saniye. Görselse varsayılan 2; videoda boş bırakılırsa videonun kendi süresi"),
+      },
+      _meta: uiMeta,
+    },
+    async ({ project_id, url, duration }) =>
+      tryRun(async () => {
+        const p = await loadProject(project_id);
+        if (!url) p.endcard = null;
+        else p.endcard = { url, duration: duration || (/\.(mp4|webm|mov|m4v)(\?|$)/i.test(url) ? null : 2) };
+        await saveProject(p);
+        return projectResult(p, baseUrl, url ? "Endcard eklendi" : "Endcard kaldırıldı");
+      })
+  );
+
   // ===== Üretim =====
   server.registerTool(
     "run_model",
@@ -1250,8 +1365,9 @@ function buildServer(baseUrl) {
       _meta: uiMeta,
     },
     async ({ endpoint_id, input, wait_seconds, attach_as, project_id, scene }) =>
-      tryRun(() => {
+      tryRun(async () => {
         const modelId = resolveModel(endpoint_id);
+        if (attach_as && project_id) await gateCheck(project_id, attach_as, modelId);
         const text = input.text || input.prompt || "";
         const ctx = { chars: typeof text === "string" ? text.length : null, durationSec: parseFloat(input.duration) || null, attach: attach_as ? att(project_id, scene, attach_as) : null };
         return runAndRender({ modelId, input, prompt: typeof text === "string" ? text : "", baseUrl, ctx, waitMs: wait_seconds * 1000 });
@@ -1275,7 +1391,8 @@ function buildServer(baseUrl) {
       _meta: uiMeta,
     },
     async ({ prompt, model, image_size, aspect_ratio, num_images, seed, extra, project_id, scene }) =>
-      tryRun(() => {
+      tryRun(async () => {
+        await gateCheck(project_id, "image", resolveModel(model));
         const input = { prompt, num_images, ...(extra || {}) };
         if (image_size) input.image_size = image_size;
         if (aspect_ratio) input.aspect_ratio = aspect_ratio;
@@ -1299,9 +1416,10 @@ function buildServer(baseUrl) {
       _meta: uiMeta,
     },
     async ({ prompt, image_urls, model, num_images, extra, project_id, scene }) =>
-      tryRun(() =>
-        runAndRender({ modelId: resolveModel(model), input: { prompt, image_urls, num_images, ...(extra || {}) }, prompt, baseUrl, ctx: { attach: att(project_id, scene, "image") }, waitMs: 110000 })
-      )
+      tryRun(async () => {
+        await gateCheck(project_id, "image", resolveModel(model));
+        return runAndRender({ modelId: resolveModel(model), input: { prompt, image_urls, num_images, ...(extra || {}) }, prompt, baseUrl, ctx: { attach: att(project_id, scene, "image") }, waitMs: 110000 });
+      })
   );
   server.registerTool(
     "generate_video",
@@ -1323,8 +1441,9 @@ function buildServer(baseUrl) {
       _meta: uiMeta,
     },
     async ({ prompt, model, image_url, end_image_url, duration, resolution, aspect_ratio, generate_audio, extra, project_id, scene }) =>
-      tryRun(() => {
+      tryRun(async () => {
         const modelId = resolveModel(model);
+        await gateCheck(project_id, "video", modelId);
         const input = { prompt };
         if (image_url) input[/kling/.test(modelId) ? "start_image_url" : "image_url"] = image_url;
         if (end_image_url) input.end_image_url = end_image_url;
@@ -1352,8 +1471,9 @@ function buildServer(baseUrl) {
       _meta: uiMeta,
     },
     async ({ text, model, voice, language, extra, project_id }) =>
-      tryRun(() => {
+      tryRun(async () => {
         const modelId = resolveModel(model);
+        await gateCheck(project_id, "voiceover", modelId);
         const isMinimax = /minimax/.test(modelId);
         const input = isMinimax ? { prompt: text } : { text };
         if (voice) isMinimax ? (input.voice_setting = { voice_id: voice }) : (input.voice = voice);
@@ -1378,8 +1498,9 @@ function buildServer(baseUrl) {
       _meta: uiMeta,
     },
     async ({ prompt, lyrics, model, duration_seconds, extra, project_id }) =>
-      tryRun(() => {
+      tryRun(async () => {
         const modelId = resolveModel(model || (lyrics ? "minimax-music" : "elevenlabs-music"));
+        await gateCheck(project_id, "music", modelId);
         const input = { prompt };
         if (lyrics) input[/minimax-music/.test(modelId) ? "lyrics_prompt" : "lyrics"] = lyrics;
         if (duration_seconds) /elevenlabs\/music/.test(modelId) ? (input.music_length_ms = Math.round(duration_seconds * 1000)) : (input.duration = duration_seconds);
@@ -1405,6 +1526,7 @@ function buildServer(baseUrl) {
     },
     async ({ media_url, model, language, max_words_per_line, extra, project_id }) =>
       tryRun(async () => {
+        await gateCheck(project_id, "subtitle");
         let url = media_url;
         if (!url && project_id) url = (await loadProject(project_id)).audio.voiceover.chosen?.url;
         if (!url) throw new Error("media_url yok ve projede seçili dış ses yok");
@@ -1437,6 +1559,7 @@ function buildServer(baseUrl) {
     },
     async (opt) =>
       tryRun(async () => {
+        await gateCheck(opt.project_id, "render");
         const p = await loadProject(opt.project_id);
         const jobId = `render-${rid(4)}`;
         const job = { status: "running", project_id: p.id };
@@ -1504,6 +1627,44 @@ function buildServer(baseUrl) {
 // ---------- HTTP ----------
 const app = express();
 app.get("/", (_req, res) => res.send(`fal MCP v${VERSION} çalışıyor · depolama: ${PERSISTENT ? "kalıcı (Volume)" : "geçici"} · ffmpeg: ${ffmpegPath ? "var" : "yok"}`));
+
+// Onay kilidi uçları (panodaki butonlar çağırır)
+const gateCors = (res) => res.set({ "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "POST, OPTIONS", "Access-Control-Allow-Headers": "*" });
+app.options("/gate/*", (_req, res) => gateCors(res).sendStatus(204));
+async function gateProject(req) {
+  const p = ensureGate(await loadProject(req.params.id));
+  if (!req.params.token || req.params.token !== p.gate_token) throw Object.assign(new Error("Geçersiz anahtar"), { status: 403 });
+  return p;
+}
+app.post("/gate/:id/:token/open", async (req, res) => {
+  gateCors(res);
+  try {
+    const p = await gateProject(req);
+    p.gate.open = true;
+    p.gate.approved_at = new Date().toISOString();
+    if (p.gate.step === "storyboard" || !p.gate.step) p.storyboard_approved = true;
+    await saveProject(p);
+    res.json({ ok: true, step: p.gate.step });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+app.post("/gate/:id/:token/model", async (req, res) => {
+  gateCors(res);
+  try {
+    const p = await gateProject(req);
+    const kind = String(req.query.kind || "");
+    const ep = String(req.query.endpoint_id || "");
+    if (!MODEL_STEPS.includes(kind) || !ep) return res.status(400).json({ error: "kind ve endpoint_id gerekli" });
+    p.user_models[kind] = resolveModel(ep);
+    p.models = p.models || {};
+    p.models[kind === "voiceover" ? "tts" : kind] = resolveModel(ep);
+    await saveProject(p);
+    res.json({ ok: true, kind, model: p.user_models[kind] });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
 
 // Yükleme
 app.get(`/${MCP_SECRET}/upload`, (_req, res) => res.type("html").send(UPLOAD_HTML(MCP_SECRET)));
