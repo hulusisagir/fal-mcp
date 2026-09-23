@@ -574,16 +574,16 @@ async function renderProject(p, baseUrl, opt) {
         // Bellek dostu ön işlem: 2K kaynağı tek başına hedef boyuta indir, sonra birleştir
         const norm = path.join(work, `n${i}.mp4`);
         await runFfmpeg([
-          "-i", file, "-t", dur.toFixed(3),
+          "-threads", "1", "-i", file, "-t", dur.toFixed(3),
           "-vf", `scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},fps=30,setsar=1,format=yuv420p`,
           "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-threads", "2",
           ...(info.hasAudio ? ["-c:a", "aac", "-b:a", "192k"] : ["-an"]),
           norm,
         ]);
         fsp.rm(file, { force: true }).catch(() => {});
-        args.push("-t", dur.toFixed(3), "-i", norm);
+        args.push("-threads", "1", "-t", dur.toFixed(3), "-i", norm);
       }
-      else args.push("-loop", "1", "-t", dur.toFixed(3), "-i", file);
+      else args.push("-threads", "1", "-loop", "1", "-t", dur.toFixed(3), "-i", file);
       const zoom = isVideo ? "" : `,zoompan=z='min(zoom+0.0008,1.08)':d=${Math.ceil(dur * 30)}:s=${W}x${H}:fps=30`;
       filters.push(`[${idx}:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H}${zoom},fps=30,setsar=1,format=yuv420p,trim=duration=${dur.toFixed(3)},setpts=PTS-STARTPTS[v${i}]`);
       vLabels.push(`[v${i}]`);
@@ -615,7 +615,7 @@ async function renderProject(p, baseUrl, opt) {
     let voLabel = null;
     if (vo) {
       const f = await download(vo.url, path.join(work, `vo.${extOf(vo.url, "mp3")}`), baseUrl);
-      args.push("-i", f);
+      args.push("-threads", "1", "-i", f);
       const off = Math.round((opt.voiceover_offset || 0) * 1000);
       filters.push(`[${idx}:a]aresample=44100,aformat=channel_layouts=stereo,volume=${opt.voiceover_volume ?? 1.0},adelay=${off}|${off}[vo]`);
       idx++;
@@ -645,9 +645,9 @@ async function renderProject(p, baseUrl, opt) {
 
     const outName = `render-${safeName(p.id)}-${Date.now()}.mp4`;
     const outFile = path.join(DIRS.media, outName);
-    const finalArgs = [...args, "-filter_complex", filters.join(";"), "-map", vOut];
+    const finalArgs = ["-filter_threads", "1", ...args, "-filter_complex", filters.join(";"), "-map", vOut];
     if (aOut) finalArgs.push("-map", aOut, "-c:a", "aac", "-b:a", "192k");
-    finalArgs.push("-threads", "2", "-filter_complex_threads", "1", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-r", "30", "-t", total.toFixed(3), "-movflags", "+faststart", outFile);
+    finalArgs.push("-threads", "2", "-filter_complex_threads", "1", "-c:v", "libx264", "-preset", "veryfast", "-rc-lookahead", "5", "-crf", "20", "-pix_fmt", "yuv420p", "-r", "30", "-t", total.toFixed(3), "-movflags", "+faststart", outFile);
     await runFfmpeg(finalArgs);
     const rec = { file: outName, at: new Date().toISOString(), duration: Math.round(total * 10) / 10, format: p.format, subtitles: vOut === "[vsub]", options: opt };
     return rec;
