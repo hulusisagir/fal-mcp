@@ -143,7 +143,8 @@ async function buildResult(result, modelId, prompt) {
 }
 
 // ---------- Galeri arayüzü (MCP Apps) ----------
-const UI_URI = "ui://fal/gallery.html";
+const UI_VERSION = "3";
+const UI_URI = `ui://fal/gallery-v${UI_VERSION}.html`;
 const UI_MIME = "text/html;profile=mcp-app";
 
 const GALLERY_HTML = `<!doctype html>
@@ -168,7 +169,8 @@ let nextId = 1; const pending = {};
 function send(msg){ window.parent.postMessage(msg, "*"); }
 function request(method, params){ const id = nextId++; send({jsonrpc:"2.0", id, method, params}); return new Promise(r => pending[id] = r); }
 function notify(method, params){ send({jsonrpc:"2.0", method, params}); }
-function openLink(url){ request("ui/open-link", {url}).catch(()=>{}); }
+function openLink(url){ try{ request("ui/open-link", {url}); }catch(e){} try{ window.open(url, "_blank", "noopener"); }catch(e){} }
+function copyUrl(inp, btn){ inp.select(); let ok=false; try{ ok=document.execCommand("copy"); }catch(e){} if(navigator.clipboard){ navigator.clipboard.writeText(inp.value).then(()=>{btn.textContent="Kopyalandı";}).catch(()=>{}); } if(ok) btn.textContent="Kopyalandı"; }
 function reportSize(){ notify("ui/notifications/size-changed", {height: document.documentElement.scrollHeight}); }
 
 function render(data){
@@ -184,12 +186,14 @@ function render(data){
         <div class="cost">\${per != null ? "≈ $" + per.toFixed(3) : "—"}</div>
       </div>
       <div class="meta"><button data-dl="\${im.url}">⬇ İndir</button><button data-open="\${im.url}">Tam boyut</button></div>
+      <div class="meta"><input readonly value="\${im.url}" style="flex:1;min-width:0;font:12px system-ui;padding:6px 8px;border-radius:8px;border:1px solid var(--line);background:transparent;color:inherit" onclick="this.select()"><button data-copy>Kopyala</button></div>
     </div>\`).join("") + '</div>' +
     '<div class="foot">Toplam ' + (data.cost_usd != null ? "≈ $" + data.cost_usd.toFixed(3) : "bilinmiyor") +
-    ' · ' + (data.cost_source === "fal" ? "fal fiyat API" : "tahmini fiyat tablosu") + '</div>';
+    ' · ' + (data.cost_source === "fal" ? "fal fiyat API" : "tahmini fiyat tablosu") + ' · arayüz v3</div>';
   el.querySelectorAll("[data-open]").forEach(b => b.onclick = () => openLink(b.dataset.open));
   el.querySelectorAll("img").forEach(b => b.onclick = () => openLink(b.dataset.url));
   el.querySelectorAll("[data-dl]").forEach(b => b.onclick = () => openLink(b.dataset.dl));
+  el.querySelectorAll("[data-copy]").forEach(b => b.onclick = () => copyUrl(b.previousElementSibling, b));
   reportSize();
 }
 
@@ -216,7 +220,7 @@ request("ui/initialize", {
 
 // ---------- MCP sunucusu ----------
 function buildServer() {
-  const server = new McpServer({ name: "fal-ai", version: "2.0.0" });
+  const server = new McpServer({ name: "fal-ai", version: "3.0.0" });
 
   server.registerResource(
     "fal-gallery",
@@ -319,7 +323,7 @@ function buildServer() {
 // ---------- HTTP ----------
 const app = express();
 app.use(express.json({ limit: "10mb" }));
-app.get("/", (_req, res) => res.send("fal MCP v2 çalışıyor"));
+app.get("/", (_req, res) => res.send("fal MCP v3 çalışıyor"));
 
 app.post(`/${MCP_SECRET}/mcp`, async (req, res) => {
   try {
@@ -344,4 +348,4 @@ const notAllowed = (_req, res) =>
 app.get(`/${MCP_SECRET}/mcp`, notAllowed);
 app.delete(`/${MCP_SECRET}/mcp`, notAllowed);
 
-app.listen(PORT, () => console.log(`fal MCP v2 :${PORT} portunda`));
+app.listen(PORT, () => console.log(`fal MCP v3 :${PORT} portunda`));
